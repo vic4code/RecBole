@@ -1,14 +1,25 @@
+# -*- coding: utf-8 -*-
+# @Time   : 2022/7/15
+# @Author : Victor Chen
+# @Email  : vic4code@gmail.com
+# @File   : fasformer.py
+
+
+r"""
+Fastformer model(Additive attention can be all you need)
+################################################
+Reference:
+    Wu, C., Wu, F., Qi, T., Huang, Y., & Xie, X. (2021). Fastformer: 
+    Additive attention can be all you need. arXiv preprint arXiv:2108.09084.
+"""
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from recbole.model.abstract_recommender import ContextRecommender
 
-class Fastformer(torch.nn.Module):
-    """Fastformer model(Additive attention can be all you need)
 
-    Wu, C., Wu, F., Qi, T., Huang, Y., & Xie, X. (2021). Fastformer: 
-    Additive attention can be all you need. arXiv preprint arXiv:2108.09084.
-
-    """
+class Fastformer(ContextRecommender):
     def __init__(self, hparams):
         super(Fastformer, self).__init__()
         self.hparams = hparams
