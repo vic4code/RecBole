@@ -435,9 +435,14 @@ class Dataset:
             self.logger.warning(f'No columns has been loaded from [{source}]')
             return None
 
+        # df = pd.read_csv(
+        #     filepath, delimiter=field_separator, usecols=usecols, dtype=dtype, encoding=encoding, engine='python'
+        # )
+        # The error is displayed before the 'engine' parameter is removed, and it is possible that the version of pandas is causing the error.
         df = pd.read_csv(
-            filepath, delimiter=field_separator, usecols=usecols, dtype=dtype, encoding=encoding, engine='python'
+            filepath, delimiter=field_separator, usecols=usecols, dtype=dtype, encoding=encoding
         )
+
         df.columns = columns
 
         seq_separator = self.config['seq_separator']

@@ -24,7 +24,7 @@ NEG_PREFIX: neg_
 # Selectively Loading
 load_col:
     inter: [user_id, item_id, label]
-    item: [item_id, category, sub_category, title, abstract]
+    item: [item_id, title]
 
 unload_col: ~
 unused_col: ~
