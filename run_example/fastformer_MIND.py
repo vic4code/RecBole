@@ -18,6 +18,7 @@ import math
 import zipfile
 import argparse
 from logging import getLogger
+import pickle
 import numpy as np
 import pandas as pd
 from recbole.config import Config
@@ -54,25 +55,21 @@ class NewsRecDataset(Dataset):
 
         # Convert news words to word embeddings matrix
         self.normed_news_words = self.get_words()
-        self.news_feature_path, self.word_embeddings_path = self.generate_embeddings(self.normed_news_words)
-        self.news_feature = self.load_glove_matrix(self.news_feature_path)
+        self.news_feature_path, self.word_embeddings_path = self.generate_embeddings(
+                                                                                     news_words=self.normed_news_words, 
+                                                                                     word_embedding_dim=self.config['word_embedding_dim']
+                                                                                    )
+        
+        self.embedding_matrix, self.exist_word = self.load_glove_matrix(
+                                                    path_emb=os.path.join(self.config['data_path'], 'word_embeddings'), 
+                                                    word_embedding_dim=self.config['word_embedding_dim']
+                                                )
 
         self._data_processing()
 
 
-    # def __init__(self, config):
-    #     super().__init__(config)
-
-        
-        # news_feature_path, word_embeddings_path = self.generate_embeddings(normed_news_words)
-        
-        # # Remap words with glove
-        # self._remap_news_words(news_feature_path, word_embeddings_path)
-        
-
     def _remap(self, remap_list):
         """Remap tokens using :meth:`pandas.factorize`.
-
         Args:
             remap_list (list): See :meth:`_get_remap_list` for detail.
         """
@@ -83,54 +80,42 @@ class NewsRecDataset(Dataset):
         new_ids_list = np.split(new_ids_list + 1, split_point)
         mp = np.array(['[PAD]'] + list(mp))
         token_id = {t: i for i, t in enumerate(mp)}
-
+      
         for (feat, field, ftype), new_ids in zip(remap_list, new_ids_list):
             if field not in self.field2id_token:
-                self.field2id_token[field] = mp
-                self.field2token_id[field] = token_id
+                if ftype == FeatureType.TOKEN_SEQ:
+                    self.field2id_token[field] = [word for word in self.word_dict.keys()]
+                    self.field2token_id[field] = self.word_dict
+                else:
+                    self.field2id_token[field] = mp
+                    self.field2token_id[field] = token_id
+
             if ftype == FeatureType.TOKEN:
                 feat[field] = new_ids
+
+            # Token to ids with Glove dictionary
             elif ftype == FeatureType.TOKEN_SEQ:
-                self.field2id_token[field] = [token for token in self.normed_news_words.keys()]
+                if field == 'title':
+                    news_title, title_size = feat[field], self.config['title_size']
+                    num_news = news_title.shape[0]
+                    news_title_index = np.zeros(
+                        (num_news, title_size), dtype="int32"
+                    )
 
-                glove_token_id = []
-                for line in feat[field]:
-                    ids = []
-                    for token in line:
-                        ids += self.news_feature(token)
-                    glove_token_id.append(ids)
+                    for news_index in range(num_news):
+                        title = news_title[news_index]
+                        for word_index in range(min(title_size, len(title))):
+                            normed_title = self.word_tokenize(title[word_index])
+                            if normed_title in self.word_dict:
+                                news_title_index[news_index, word_index] = self.word_dict[
+                                    normed_title.lower()
+                                ]
 
-                feat[field] = glove_token_id
-                print(self.field2id_token[field][:5])
-                # feat[field] = _token2_ids()
-
-
-            # print(mp[:5])
-            # print(list(token_id.items())[:5])
-    
-    # def _token2_ids(self):
-
-    def _remap_news_words(self, news_feature_path, word_embeddings_path):
-        """Remap news tokens using glove`.
-        """
-        embedding_matrix, exist_word = self.load_glove_matrix(news_feature_path, word_embeddings_path)
-
-        print(embedding_matrix.shape)
-        print(len(exist_word))
-        # if len(remap_list) == 0:
-        #     return
-        # tokens, split_point = self._concat_remaped_tokens(remap_list)
-        # new_ids_list, mp = pd.factorize(tokens)
-        # new_ids_list = np.split(new_ids_list + 1, split_point)
-        # mp = np.array(['[PAD]'] + list(mp))
-        # token_id = {t: i for i, t in enumerate(mp)}
-
-        # for (feat, field, ftype), new_ids in zip(remap_list, new_ids_list):
-        #     if field not in self.field2id_token:
-        #         self.field2id_token[field] = mp
-        #         self.field2token_id[field] = token_id
-        #     if ftype == FeatureType.TOKEN:
-        #         feat[field] = new_ids
+                    token_list = [news_title_index[i, :] for i in range(num_news)]
+                    feat[field] = token_list
+                else:
+                    split_point = np.cumsum(feat[field].agg(len))[:-1]
+                    feat[field] = np.split(new_ids, split_point)
 
         
     def _load_data(self, token, dataset_path):
@@ -275,6 +260,7 @@ class NewsRecDataset(Dataset):
         news_words,
         max_sentence=10,
         word_embedding_dim=100,
+        skip=True,
     ):
         """Generate embeddings.
         Args:
@@ -284,13 +270,23 @@ class NewsRecDataset(Dataset):
         Returns:
             str, str: File paths to news, and word embeddings.
         """
+
+        news_feature_path = os.path.join(data_path, "doc_feature.txt")
+        word_embeddings_path = os.path.join(
+            data_path, "word_embeddings_5w_" + str(word_embedding_dim) + ".npy"
+        )
+
+        if skip:
+            self.logger.info("Skip generating...")
+            return news_feature_path, word_embeddings_path
+
         embedding_dimensions = [50, 100, 200, 300]
         if word_embedding_dim not in embedding_dimensions:
             raise ValueError(
                 f"Wrong embedding dimension, available options are {embedding_dimensions}"
             )
 
-        logger.info("Downloading glove...")
+        self.logger.info("Downloading glove...")
         data_path = os.path.join(self.config['data_path'], 'word_embeddings')
         if not os.path.exists:
             os.makedirs(data_path)
@@ -300,7 +296,7 @@ class NewsRecDataset(Dataset):
         word_embedding_dict = {}
         entity_embedding_dict = {}
 
-        logger.info(f"Loading glove with embedding dimension {word_embedding_dim}...")
+        self.logger.info(f"Loading glove with embedding dimension {word_embedding_dim}...")
         glove_file = "glove.6B." + str(word_embedding_dim) + "d.txt"
         fp_pretrain_vec = open(os.path.join(glove_path, glove_file), "r", encoding="utf-8")
         for line in fp_pretrain_vec:
@@ -309,8 +305,8 @@ class NewsRecDataset(Dataset):
             word_embedding_dict[linesplit[0]] = np.asarray(list(map(float, linesplit[1:])))
         fp_pretrain_vec.close() 
 
-        logger.info("Generating word indexes...")
-        word_dict = {}
+        self.logger.info("Generating word indexes...")
+        self.word_dict = {}
         word_index = 1
         news_word_string_dict = {}
         for doc_id in news_words:
@@ -318,23 +314,26 @@ class NewsRecDataset(Dataset):
             
             for i in range(len(news_words[doc_id])):
                 if news_words[doc_id][i] in word_embedding_dict:
-                    if news_words[doc_id][i] not in word_dict:
-                        word_dict[news_words[doc_id][i]] = word_index
+                    if news_words[doc_id][i] not in self.word_dict:
+                        self.word_dict[news_words[doc_id][i]] = word_index
                         word_index = word_index + 1
-                        news_word_string_dict[doc_id][i] = word_dict[news_words[doc_id][i]]
+                        news_word_string_dict[doc_id][i] = self.word_dict[news_words[doc_id][i]]
                     else:
-                        news_word_string_dict[doc_id][i] = word_dict[news_words[doc_id][i]]
+                        news_word_string_dict[doc_id][i] = self.word_dict[news_words[doc_id][i]]
                     
                 if i == max_sentence - 1:
                     break
 
-        logger.info("Generating word embeddings...")
+        self.logger.info("Generating word embeddings...")
         word_embeddings = np.zeros([word_index, word_embedding_dim])
-        for word in word_dict:
-            word_embeddings[word_dict[word]] = word_embedding_dict[word]
+        for word in self.word_dict:
+            word_embeddings[self.word_dict[word]] = word_embedding_dict[word]
 
-        news_feature_path = os.path.join(data_path, "doc_feature.txt")
-        logger.info(f"Saving word features in {news_feature_path}")
+        self.logger.info("Saving word dictionary as .pkl ...")
+        with open(os.path.join(data_path, 'word_dict.pkl'), 'wb') as f:
+            pickle.dump(self.word_dict, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+        self.logger.info(f"Saving word features in {news_feature_path}")
         fp_doc_string = open(news_feature_path, "w", encoding="utf-8")
         for doc_id in news_word_string_dict:
             fp_doc_string.write(
@@ -343,30 +342,30 @@ class NewsRecDataset(Dataset):
                 + ",".join(list(map(str, news_word_string_dict[doc_id])))
                 + "\n"
             )
-
-        word_embeddings_path = os.path.join(
-            data_path, "word_embeddings_5w_" + str(word_embedding_dim) + ".npy"
-        )
-        logger.info(f"Saving word embeddings in {word_embeddings_path}")
+        
+        self.logger.info(f"Saving word embeddings in {word_embeddings_path}")
         np.save(word_embeddings_path, word_embeddings)
 
         return news_feature_path, word_embeddings_path
 
 
-    def load_glove_matrix(self, news_feature_path, word_embeddings_path):
+    def load_glove_matrix(self, path_emb, word_embedding_dim):
         """Load pretrained embedding metrics of words in word_dict
         Args:
-            path_emb (string): Folder path of downloaded glove file
+            path_emb (string): Folder path of word embeddings
             word_dict (dict): word dictionary
             word_embedding_dim: dimention of word embedding vectors
         Returns:
             numpy.ndarray, list: pretrained word embedding metrics, words can be found in glove files
         """
 
-        embedding_matrix = np.load(word_embeddings_path)
-        
-        word2ids = []
-        with open(os.path.join(path_emb, f"glove.6B.{word_embedding_dim}d.txt"), "rb") as f:
+        with open(os.path.join(path_emb, 'word_dict.pkl'), 'rb') as f:
+            word_dict = pickle.load(f)
+   
+        embedding_matrix = np.zeros((len(word_dict) + 1, word_embedding_dim))
+        exist_word = []
+
+        with open(os.path.join(path_emb, "glove", f"glove.6B.{word_embedding_dim}d.txt"), "rb") as f:
             for l in tqdm(f):  # noqa: E741 ambiguous variable name 'l'
                 l = l.split()  # noqa: E741 ambiguous variable name 'l'
                 word = l[0].decode()
@@ -387,13 +386,14 @@ class NewsRecDataset(Dataset):
         Returns:
             list: words in the sentence
         """
-
+        import re
         # treat consecutive words or special punctuation as words
         pat = re.compile(r"[\w]+|[.,!?;|]")
         if isinstance(sent, str):
-            return pat.findall(sent.lower())
+            normed_string_list = pat.findall(sent.lower())
+            return normed_string_list[0] if normed_string_list else ""
         else:
-            return []
+            return ""
 
 
 class NewsRecTrainer(Trainer):
@@ -516,10 +516,6 @@ if __name__ == '__main__':
 
     # dataset filtering
     dataset = NewsRecDataset(config)
-    print(dataset.item_feat)
-    # print(dataset.field2id_token)
-    # print(dataset.field2token_id)
-    # dataset.init_news()
     logger.info(dataset)
 
     # dataset splitting
