@@ -22,9 +22,12 @@ import pickle
 import numpy as np
 import pandas as pd
 from recbole.config import Config
+from recbole.sampler import Sampler
 from recbole.data import create_dataset, dataset
 from recbole.data.dataset import Dataset
-from recbole.data.utils import get_dataloader
+from recbole.data.dataloader.general_dataloader import TrainDataLoader
+from recbole.data.utils import get_dataloader, create_samplers
+from recbole.data.interaction import Interaction
 from recbole.utils import init_logger, init_seed, get_model, get_trainer, set_color, FeatureSource, FeatureType
 from recbole.trainer.trainer import Trainer
 from tqdm import tqdm
@@ -66,6 +69,7 @@ class NewsRecDataset(Dataset):
                                                 )
 
         self._data_processing()
+        self.userid2clickednews = self.get_clickednews(dataset_path=self.dataset_path)
 
 
     def _remap(self, remap_list):
@@ -154,12 +158,11 @@ class NewsRecDataset(Dataset):
                 else:
                     raise ValueError(f'File {file_path} not exist.')
             item_feat = pd.concat(sub_item_feats, ignore_index=True)
-        
+
         return item_feat
 
 
     def _read_news(self, news_words, tokenizer):
-
         lines = self.item_feat['title']
         for line in lines:
             for word in line:
@@ -168,6 +171,32 @@ class NewsRecDataset(Dataset):
                     news_words[splitted[0]] = tokenizer.tokenize(splitted[0].lower())
 
         return news_words
+
+    
+    def get_clickednews(self, dataset_path):
+        """Save user_ids to clicked news dictionary.
+        Args:
+            dataset_path
+        Returns:
+            dict: userid2clickednews {user_id:clicked_news_id}
+        """
+
+        if not os.path.exists(os.path.join(dataset_path, 'userid2clickednews.pkl')):
+            user_ids = list(set(self.inter_feat['user_id']))
+            userid2clickednews = {user_id:[] for user_id in user_ids}
+            
+            self.logger.info("Restore user_ids to the corresponding clicked_news...")
+            for i in tqdm(range(self.inter_num)):
+                if self.inter_feat.iloc[i]['label'] == 1:
+                    userid2clickednews[self.inter_feat.iloc[i]['user_id']].append(int(self.inter_feat.iloc[i]['item_id'])) 
+                    
+            with open(os.path.join(dataset_path, 'userid2clickednews.pkl'), 'wb') as f:
+                pickle.dump(userid2clickednews, f, protocol=pickle.HIGHEST_PROTOCOL)
+        else:
+            with open(os.path.join(dataset_path, 'userid2clickednews.pkl'), 'rb') as f:
+                userid2clickednews = pickle.load(f)
+    
+        return userid2clickednews
 
 
     def unzip_file(self, zip_src, dst_dir, clean_zip_file=False):
@@ -271,13 +300,14 @@ class NewsRecDataset(Dataset):
             str, str: File paths to news, and word embeddings.
         """
 
+        data_path = os.path.join(self.config['data_path'], 'word_embeddings')
         news_feature_path = os.path.join(data_path, "doc_feature.txt")
         word_embeddings_path = os.path.join(
             data_path, "word_embeddings_5w_" + str(word_embedding_dim) + ".npy"
         )
 
         if skip:
-            self.logger.info("Skip generating...")
+            self.logger.info("Skip generating embeddings...")
             return news_feature_path, word_embeddings_path
 
         embedding_dimensions = [50, 100, 200, 300]
@@ -287,7 +317,6 @@ class NewsRecDataset(Dataset):
             )
 
         self.logger.info("Downloading glove...")
-        data_path = os.path.join(self.config['data_path'], 'word_embeddings')
         if not os.path.exists:
             os.makedirs(data_path)
         glove_path = self.download_and_extract_glove(data_path)
@@ -360,19 +389,20 @@ class NewsRecDataset(Dataset):
         """
 
         with open(os.path.join(path_emb, 'word_dict.pkl'), 'rb') as f:
-            word_dict = pickle.load(f)
+            self.word_dict = pickle.load(f)
    
-        embedding_matrix = np.zeros((len(word_dict) + 1, word_embedding_dim))
+        embedding_matrix = np.zeros((len(self.word_dict) + 1, word_embedding_dim))
         exist_word = []
 
+        self.logger.info("Loading embedding_matrix and exist_word")
         with open(os.path.join(path_emb, "glove", f"glove.6B.{word_embedding_dim}d.txt"), "rb") as f:
             for l in tqdm(f):  # noqa: E741 ambiguous variable name 'l'
                 l = l.split()  # noqa: E741 ambiguous variable name 'l'
                 word = l[0].decode()
                 if len(word) != 0:
-                    if word in word_dict:
+                    if word in self.word_dict:
                         wordvec = [float(x) for x in l[1:]]
-                        index = word_dict[word]
+                        index = self.word_dict[word]
                         embedding_matrix[index] = np.array(wordvec)
                         exist_word.append(word)
 
@@ -394,6 +424,38 @@ class NewsRecDataset(Dataset):
             return normed_string_list[0] if normed_string_list else ""
         else:
             return ""
+    
+
+class NewsRecTrainDataLoader(TrainDataLoader):
+    def __init__(self, config, dataset, sampler, shuffle=False):
+        self._set_neg_sample_args(config, dataset, config['MODEL_INPUT_TYPE'], config['train_neg_sample_args'])
+        super().__init__(config, dataset, sampler, shuffle=shuffle)
+
+        print(dir(dataset))
+        print(dataset.inter_feat, dataset.item_feat)
+
+        print(dataset.item_feat[0])
+        print(list(dataset.userid2clickednews.items())[:5])
+
+
+    # def _init_batch_size_and_step(self):
+    #     batch_size = self.config['train_batch_size']
+    #     self.step = batch_size
+    #     self.set_batch_size(batch_size)
+
+    def _neg_sampling(self):
+        
+
+
+    def _next_batch_data(self):
+        cur_data = self._neg_sampling(self.dataset[self.pr:self.pr + self.step])
+        self.pr += self.step
+
+        user_ids = cur_data['user_id']
+   
+        self.config['clicked_news_num']
+
+        return cur_data
 
 
 class NewsRecTrainer(Trainer):
@@ -465,28 +527,30 @@ def get_args():
     parser.add_argument('--dataset', '-d', type=str, default='mind', help='Benchmarks for news rec.')
     parser.add_argument('--validation', action='store_true', default=None, help='Whether evaluating on validation set (split from train set), otherwise on test set.')
     parser.add_argument('--valid_portion', type=float, default=0.1, help='ratio of validation set.')
+
     return parser.parse_known_args()[0]
 
 
 if __name__ == '__main__':
     args = get_args()
 
-    # configurations initialization
+    # configurations for training
     config_dict = {
         'benchmark_filename': ['small_train', 'small_dev'],
         'epochs': 300,
-        'train_batch_size': 64,
+        'train_batch_size': 32,
         'learner': 'adam',
         'learning_rate': 0.001,
-        'neg_sampling': None,
-        'uniform': 1,
+        'neg_sampling': {   
+                            'uniform' : 4,
+                            # 'dynamic': 4,
+                        },
         'eval_step': 1,
         'stopping_step': 10,
-        # clip_grad_norm:  {'max_norm': 5, 'norm_type': 2}
         'weight_decay': 0.0,
         'loss_decimal_place': 4,
         'require_pow': False,
-
+        'word_embedding_file': "./dataset/mind/word_embeddings/word_embeddings_5w_300.npy",
         # evaluation settings
         # 'eval_args':{ 
         #     'split': {'RS':[0.8,0.1,0.1]},
@@ -519,19 +583,29 @@ if __name__ == '__main__':
     logger.info(dataset)
 
     # dataset splitting
-    # train_dataset, test_dataset = dataset.build()
-    # if args.validation:
-    #     print('val')
-    #     train_dataset.shuffle()
-    #     new_train_dataset, new_test_dataset = train_dataset.split_by_ratio([1 - args.valid_portion, args.valid_portion])
-    #     train_data = get_dataloader(config, 'train')(config, new_train_dataset, None, shuffle=True)
-    #     test_data = get_dataloader(config, 'test')(config, new_test_dataset, None, shuffle=False)
-    # else:
-    #     train_data = get_dataloader(config, 'train')(config, train_dataset, None, shuffle=True)
-    #     test_data = get_dataloader(config, 'test')(config, test_dataset, None, shuffle=False)
+    train_dataset, test_dataset = dataset.build()
 
+    # get sampler
+    train_sampler, valid_sampler, test_sampler = create_samplers(config, dataset, built_datasets=[train_dataset, test_dataset, test_dataset])
+
+    if args.validation:
+        train_dataset.shuffle()
+        new_train_dataset, new_test_dataset = train_dataset.split_by_ratio([1 - args.valid_portion, args.valid_portion])
+        train_data = get_dataloader(config, 'train')(config, new_train_dataset, train_sampler, shuffle=True)
+        test_data = get_dataloader(config, 'test')(config, new_test_dataset, None, shuffle=False)
+    else:
+        train_data = NewsRecTrainDataLoader(config, train_dataset, train_sampler, shuffle=True)
+        test_data = get_dataloader(config, 'test')(config, test_dataset, None, shuffle=False)
+
+    batch = train_data._next_batch_data()
+    print(batch)
     # print(train_data._next_batch_data())
-    # # # model loading and initialization
+    print(batch['user_id'])
+    print(batch['item_id'])
+    print(batch['label'])
+    print(batch['title'])
+
+    # model loading and initialization
     # model = get_model(config['model'])(config, train_data.dataset).to(config['device'])
     # logger.info(model)
 
@@ -543,4 +617,4 @@ if __name__ == '__main__':
     #     train_data, test_data, saved=True, show_progress=config['show_progress']
     # )
 
-    # logger.info(set_color('test result', 'yellow') + f': {test_result}')
+    # # logger.info(set_color('test result', 'yellow') + f': {test_result}')

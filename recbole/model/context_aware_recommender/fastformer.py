@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# @Time   : 2022/7/15
+# @Time   : 2022/9/15
 # @Author : Victor Chen
 # @Email  : vic4code@gmail.com
 # @File   : fasformer.py
@@ -13,49 +13,85 @@ Reference:
     Additive attention can be all you need. arXiv preprint arXiv:2108.09084.
 """
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from recbole.model.abstract_recommender import ContextRecommender
+from logging import getLogger
 
+logger = getLogger()
 
 class Fastformer(ContextRecommender):
-    def __init__(self, hparams):
-        super(Fastformer, self).__init__()
-        self.hparams = hparams
-        self.dense_linear = nn.Linear(hparams.hidden_size, hparams.output_size)
-        self.word_embedding = nn.Embedding(hparams.vocab_size, hparams.word_emb_dim, padding_idx=0)
-        self.encoder = FastformerEncoder(hparams)
+    def __init__(self, config, dataset):
+        super(Fastformer, self).__init__(config, dataset)
+        self.config = config
+        self.dense_linear = nn.Linear(config.hidden_size, config.output_size)
+        self.word2vec_embedding = self._init_embedding(config.word_embedding_file)
+        self.word_embedding = nn.Embedding.from_pretrained(self.word2vec_embedding)
+        self.newsencoder = FastformerEncoder(config)
+        self.userencoder = FastformerEncoder(config)
+        self.softmax = nn.Softmax()
+
+        self.loss = nn.BCELoss()
+
         self.apply(self.init_weights)
         
+
+    def _init_embedding(self, file_path):
+        """Load pre-trained embeddings as a constant tensor.
+        Args:
+            file_path (str): the pre-trained glove embeddings file path.
+        Returns:
+            numpy.ndarray: A constant numpy array.
+        """
+
+        return torch.from_numpy(np.load(file_path))
+
+
     def init_weights(self, module):
         if isinstance(module, (nn.Linear, nn.Embedding)):
-            module.weight.data.normal_(mean=0.0, std=self.hparams.initializer_range)
+            module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
             if isinstance(module, (nn.Embedding)) and module.padding_idx is not None:
                 with torch.no_grad():
                     module.weight[module.padding_idx].fill_(0)
         if isinstance(module, nn.Linear) and module.bias is not None:
             module.bias.data.zero_()
     
-    def forward(self, input_ids, targets):
-        mask = input_ids.bool().float()
-        embds = self.word_embedding(input_ids)
-        text_vec = self.encoder(embds, mask)
-        score = self.dense_linear(text_vec)
 
+    def forward(self, interation):
+        print(interation)
+        fastformer_all_embeddings = self.concat_embed_input_fields(interation) # [batch_size, num_field, embed_dim]
+        print(fastformer_all_embeddings.shape)
+        
+        embds = self.word_embedding(fastformer_all_embeddings)
+        news_present = self.newsencoder(embds)
+        user_present = self.userencoder(news_present)
+        score = news_present * user_present
+        score = self.softmax(score)
+    
         return score
 
+    def calculate_loss(self, interaction):
+        label = interaction[self.LABEL]
+        output = self.forward(interaction)
+        return self.loss(output, label)
+
+    def predict(self, interaction):
+        return self.forward(interaction)
+
+
 class AttentionPooling(nn.Module):
-    def __init__(self, hparams):
-        self.hparams = hparams
+    def __init__(self, config):
+        self.config = config
         super(AttentionPooling, self).__init__()
-        self.att_fc1 = nn.Linear(hparams.hidden_size, hparams.hidden_size)
-        self.att_fc2 = nn.Linear(hparams.hidden_size, 1)
+        self.att_fc1 = nn.Linear(config.hidden_size, config.hidden_size)
+        self.att_fc2 = nn.Linear(config.hidden_size, 1)
         self.apply(self.init_weights)
         
     def init_weights(self, module):
         if isinstance(module, nn.Linear):
-            module.weight.data.normal_(mean=0.0, std=self.hparams.initializer_range)
+            module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
         if isinstance(module, nn.Linear) and module.bias is not None:
             module.bias.data.zero_()
             
@@ -74,18 +110,18 @@ class AttentionPooling(nn.Module):
         return x
 
 class FastSelfAttention(nn.Module):
-    def __init__(self, hparams):
+    def __init__(self, config):
         super(FastSelfAttention, self).__init__()
-        self.hparams = hparams
-        if hparams.hidden_size % hparams.num_attention_heads != 0:
+        self.config = config
+        if config.hidden_size % config.num_attention_heads != 0:
             raise ValueError(
                 "The hidden size (%d) is not a multiple of the number of attention "
                 "heads (%d)" %
-                (hparams.hidden_size, hparams.num_attention_heads))
-        self.attention_head_size = int(hparams.hidden_size /hparams.num_attention_heads)
-        self.num_attention_heads = hparams.num_attention_heads
+                (config.hidden_size, config.num_attention_heads))
+        self.attention_head_size = int(config.hidden_size /config.num_attention_heads)
+        self.num_attention_heads = config.num_attention_heads
         self.all_head_size = self.num_attention_heads * self.attention_head_size
-        self.input_dim= hparams.hidden_size
+        self.input_dim = config.hidden_size
         
         self.query = nn.Linear(self.input_dim, self.all_head_size)
         self.query_att = nn.Linear(self.all_head_size, self.num_attention_heads)
@@ -97,7 +133,7 @@ class FastSelfAttention(nn.Module):
 
     def init_weights(self, module):
         if isinstance(module, nn.Linear):
-            module.weight.data.normal_(mean=0.0, std=self.hparams.initializer_range)
+            module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
         if isinstance(module, nn.Linear) and module.bias is not None:
             module.bias.data.zero_()
                 
@@ -152,14 +188,14 @@ class FastSelfAttention(nn.Module):
         return weighted_value
 
 class FastAttention(nn.Module):
-    def __init__(self, hparams):
+    def __init__(self, config):
         super(FastAttention, self).__init__()
-        self.selfattn = FastSelfAttention(hparams)
+        self.selfattn = FastSelfAttention(config)
         self.output = nn.Sequential(
-                                nn.Linear(hparams.hidden_size, hparams.hidden_size),
-                                nn.Dropout(hparams.hidden_dropout_prob)
+                                nn.Linear(config.hidden_size, config.hidden_size),
+                                nn.Dropout(config.hidden_dropout_prob)
                             )
-        self.LayerNorm = nn.LayerNorm(hparams.hidden_size, eps=hparams.layer_norm_eps)
+        self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
 
     def forward(self, input_tensor, attention_mask):
         self_output = self.selfattn(input_tensor, attention_mask)
@@ -168,19 +204,20 @@ class FastAttention(nn.Module):
 
         return attention_output
 
+
 class FastformerLayer(nn.Module):
-    def __init__(self, hparams):
+    def __init__(self, config):
         super(FastformerLayer, self).__init__()
-        self.attention = FastAttention(hparams)
+        self.attention = FastAttention(config)
         self.intermediate = nn.Sequential(
-                                nn.Linear(hparams.hidden_size, hparams.intermediate_size),
+                                nn.Linear(config.hidden_size, config.intermediate_size),
                                 nn.GELU()
                             )
         self.output = nn.Sequential(
-                                nn.Linear(hparams.intermediate_size, hparams.hidden_size),
-                                nn.Dropout(hparams.hidden_dropout_prob)
+                                nn.Linear(config.intermediate_size, config.hidden_size),
+                                nn.Dropout(config.hidden_dropout_prob)
                             )
-        self.LayerNorm = nn.LayerNorm(hparams.hidden_size, eps=hparams.layer_norm_eps)
+        self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
 
     def forward(self, hidden_states, attention_mask):
         attention_output = self.attention(hidden_states, attention_mask)
@@ -190,27 +227,28 @@ class FastformerLayer(nn.Module):
 
         return layer_output
     
+
 class FastformerEncoder(nn.Module):
-    def __init__(self, hparams, pooler_count=1):
+    def __init__(self, config, pooler_count=1):
         super(FastformerEncoder, self).__init__()
-        self.hparams = hparams
-        self.encoders = nn.ModuleList([FastformerLayer(hparams) for _ in range(hparams.num_hidden_layers)])
-        self.position_embeddings = nn.Embedding(hparams.max_position_embeddings, hparams.hidden_size)
-        self.LayerNorm = nn.LayerNorm(hparams.hidden_size, eps=hparams.layer_norm_eps)
-        self.dropout = nn.Dropout(hparams.hidden_dropout_prob)
+        self.config = config
+        self.encoders = nn.ModuleList([FastformerLayer(config) for _ in range(config.num_hidden_layers)])
+        self.position_embeddings = nn.Embedding(config.max_position_embeddings, config.hidden_size)
+        self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        self.dropout = nn.Dropout(config.hidden_dropout_prob)
 
         # support multiple different poolers with shared bert encoder.
         self.poolers = nn.ModuleList()
-        if hparams.pooler_type == 'weightpooler':
+        if config.pooler_type == 'weightpooler':
             for _ in range(pooler_count):
-                self.poolers.append(AttentionPooling(hparams))
-        logging.info(f"This model has {len(self.poolers)} poolers.")
+                self.poolers.append(AttentionPooling(config))
+        logger.info(f"This model has {len(self.poolers)} poolers.")
 
         self.apply(self.init_weights)
 
     def init_weights(self, module):
         if isinstance(module, (nn.Linear, nn.Embedding)):
-            module.weight.data.normal_(mean=0.0, std=self.hparams.initializer_range)
+            module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
             if isinstance(module, (nn.Embedding)) and module.padding_idx is not None:
                 with torch.no_grad():
                     module.weight[module.padding_idx].fill_(0)
@@ -250,4 +288,3 @@ class FastformerEncoder(nn.Module):
         output = self.poolers[pooler_index](all_hidden_states[-1], attention_mask)
 
         return output 
-    
